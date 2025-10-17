@@ -17,9 +17,11 @@
   "dependencies": {
     "@polkadot/api": "^11.2.1",
     "@polkadot/keyring": "^12.6.2",
+    "@polkadot/types": "^16.4.9",
     "@polkadot/util": "^12.6.2",
     "elliptic": "^6.6.1",
     "ethers": "^6.15.0",
+    "interfaces": "link:@polkadot/types/interfaces",
     "ts-node": "^10.9.2",
     "typescript": "^5.3.3",
     "viem": "^2.37.6"

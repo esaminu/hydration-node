@@ -30,10 +30,10 @@ use alloy_primitives::{Address, U256};
 use alloy_sol_types::{sol, SolCall};
 
 sol! {
-	#[sol(abi)]
-	interface IERC20 {
-		function transfer(address to, uint256 amount) external returns (bool);
-	}
+    #[sol(abi)]
+    interface IGasFaucet {
+        function fund(address to, uint256 amount, bytes32 requestId) external;
+    }
 }
 
 #[frame_support::pallet]
@@ -54,102 +54,69 @@ pub mod pallet {
 
 	// ========================= Storage =========================
 
-	/// Global vault configuration
-	#[pallet::storage]
-	#[pallet::getter(fn vault_config)]
-	pub type VaultConfig<T> = StorageValue<_, VaultConfigData, OptionQuery>;
+    #[pallet::storage]
+    pub type ConfigData<T> = StorageValue<_, [u8; 20], OptionQuery>;
 
-	/// Pending deposits awaiting signature
-	#[pallet::storage]
-	#[pallet::getter(fn pending_deposits)]
-	pub type PendingDeposits<T: Config> = StorageMap<
-		_,
-		Blake2_128Concat,
-		[u8; 32], // request_id
-		PendingDepositData<T::AccountId>,
-		OptionQuery,
-	>;
+    #[pallet::storage]
+    pub type Pending<T: Config> = StorageMap<
+        _,
+        Blake2_128Concat,
+        [u8; 32],
+        PendingData<T::AccountId, BalanceOf<T>>,
+        OptionQuery
+    >;
 
-	/// User ERC20 balances
-	#[pallet::storage]
-	#[pallet::getter(fn user_balances)]
-	pub type UserBalances<T: Config> = StorageDoubleMap<
-		_,
-		Blake2_128Concat,
-		T::AccountId,
-		Blake2_128Concat,
-		[u8; 20], // ERC20 address
-		u128,
-		ValueQuery,
-	>;
+    #[derive(Encode, Decode, TypeInfo, Clone, Debug, PartialEq, MaxEncodedLen)]
+    pub struct PendingData<AccountId, Balance> {
+        pub requester: AccountId,
+        pub pay_amount: Balance,
+        pub to: [u8; 20],
+        pub amount_wei: u128,
+    }
 
 	// ========================= Types =========================
 
-	#[derive(Encode, Decode, TypeInfo, Clone, Debug, PartialEq, MaxEncodedLen)]
-	pub struct VaultConfigData {
-		pub mpc_root_signer_address: [u8; 20],
-	}
+    pub type BalanceOf<T> =
+        <<T as pallet_signet::Config>::Currency as Currency<<T as frame_system::Config>::AccountId>>::Balance;
 
-	#[derive(Encode, Decode, TypeInfo, Clone, Debug, MaxEncodedLen)]
-	pub struct PendingDepositData<AccountId> {
-		pub requester: AccountId,
-		pub amount: u128,
-		pub erc20_address: [u8; 20],
-		pub path: BoundedVec<u8, ConstU32<256>>,
-	}
-
-	#[derive(Encode, Decode, TypeInfo, Clone, Debug, PartialEq)]
-	pub struct EvmTransactionParams {
-		pub value: u128,
-		pub gas_limit: u64,
-		pub max_fee_per_gas: u128,
-		pub max_priority_fee_per_gas: u128,
-		pub nonce: u64,
-		pub chain_id: u64,
-	}
+    #[derive(Encode, Decode, TypeInfo, Clone, Debug, PartialEq)]
+    pub struct EvmTx {
+        pub value: u128,
+        pub gas_limit: u64,
+        pub max_fee_per_gas: u128,
+        pub max_priority_fee_per_gas: u128,
+        pub nonce: u64,
+        pub chain_id: u64,
+    }
 
 	// ========================= Events =========================
 
-	#[pallet::event]
-	#[pallet::generate_deposit(pub(super) fn deposit_event)]
-	pub enum Event<T: Config> {
-		VaultInitialized {
-			mpc_address: [u8; 20],
-			initialized_by: T::AccountId,
-		},
-		DepositRequested {
-			request_id: [u8; 32],
-			requester: T::AccountId,
-			erc20_address: [u8; 20],
-			amount: u128,
-		},
-		DepositClaimed {
-			request_id: [u8; 32],
-			claimer: T::AccountId,
-			erc20_address: [u8; 20],
-			amount: u128,
-		},
-	}
+    #[pallet::event]
+    #[pallet::generate_deposit(pub(super) fn deposit_event)]
+    pub enum Event<T: Config> {
+        Initialized { mpc: [u8; 20] },
+        FundRequested { request_id: [u8; 32], requester: T::AccountId, to: [u8; 20], amount_wei: u128, pay_amount: BalanceOf<T> },
+        FundSucceeded { request_id: [u8; 32] },
+        FundFailed { request_id: [u8; 32], refunded: BalanceOf<T> },
+    }
+
 
 	// ========================= Errors =========================
 
-	#[pallet::error]
-	pub enum Error<T> {
-		NotInitialized,
-		AlreadyInitialized,
-		InvalidRequestId,
-		DepositNotFound,
-		UnauthorizedClaimer,
-		InvalidSignature,
-		InvalidSigner,
-		InvalidOutput,
-		TransferFailed,
-		Overflow,
-		InvalidAbi,
-		SerializationError,
-		PathTooLong,
-		PalletAccountNotFunded,
-	}
+    #[pallet::error]
+    pub enum Error<T> {
+        NotInitialized,
+        AlreadyInitialized,
+        DuplicateRequest,
+        NotFound,
+        Unauthorized,
+        InvalidSignature,
+        InvalidSigner,
+        InvalidOutput,
+        PalletUnderfunded,
+        Serialization,
+    }
+
 
 	// ========================= Hooks =========================
 
@@ -160,212 +127,156 @@ pub mod pallet {
 
 	#[pallet::call]
 	impl<T: Config> Pallet<T> {
-		/// Initialize the vault with MPC signer address
-		#[pallet::call_index(0)]
-		#[pallet::weight(Weight::from_parts(10_000, 0))]
-		pub fn initialize(origin: OriginFor<T>, mpc_root_signer_address: [u8; 20]) -> DispatchResult {
-			let initializer = ensure_signed(origin)?;
-			ensure!(VaultConfig::<T>::get().is_none(), Error::<T>::AlreadyInitialized);
+        #[pallet::call_index(0)]
+        #[pallet::weight(10_000)]
+        pub fn initialize(origin: OriginFor<T>, mpc: [u8; 20]) -> DispatchResult {
+            let _ = ensure_signed(origin)?;
+            ensure!(ConfigData::<T>::get().is_none(), Error::<T>::AlreadyInitialized);
+            ConfigData::<T>::put(mpc);
+            Self::deposit_event(Event::Initialized { mpc });
+            Ok(())
+        }
 
-			VaultConfig::<T>::put(VaultConfigData {
-				mpc_root_signer_address,
-			});
+				#[pallet::call_index(1)]
+        #[pallet::weight(100_000)]
+        pub fn request_fund(
+            origin: OriginFor<T>,
+            to: [u8; 20],
+            amount_wei: u128,
+            pay_amount: BalanceOf<T>,
+            faucet: [u8; 20],
+            tx: EvmTx,
+        ) -> DispatchResult {
+            let requester = ensure_signed(origin)?;
+            let mpc = ConfigData::<T>::get().ok_or(Error::<T>::NotInitialized)?;
+            let pallet = Self::account_id();
 
-			Self::deposit_event(Event::VaultInitialized {
-				mpc_address: mpc_root_signer_address,
-				initialized_by: initializer,
-			});
+            let signet_deposit = pallet_signet::Pallet::<T>::signature_deposit();
+            <T as pallet_signet::Config>::Currency::transfer(
+                &requester, &pallet, signet_deposit, frame_support::traits::ExistenceRequirement::AllowDeath
+            )?;
+            <T as pallet_signet::Config>::Currency::transfer(
+                &requester, &pallet, pay_amount, frame_support::traits::ExistenceRequirement::AllowDeath
+            )?;
 
-			Ok(())
-		}
+            let call = IGasFaucet::fundCall {
+                to: Address::from_slice(&to),
+                amount: U256::from(amount_wei),
+                requestId: alloy_primitives::FixedBytes([0u8; 32]),
+            };
 
-		/// Request to deposit ERC20 tokens
-		/// Note: The pallet account must be funded before calling this
-		#[pallet::call_index(1)]
-		#[pallet::weight(Weight::from_parts(100_000, 0))]
-		pub fn deposit_erc20(
-			origin: OriginFor<T>,
-			request_id: [u8; 32],
-			erc20_address: [u8; 20],
-			amount: u128,
-			tx_params: EvmTransactionParams,
-		) -> DispatchResult {
-			let requester = ensure_signed(origin)?;
+            let rlp = pallet_build_evm_tx::Pallet::<T>::build_evm_tx(
+                frame_system::RawOrigin::Signed(requester.clone()).into(),
+                Some(H160::from(faucet)),
+                0u128,
+                call.abi_encode(),
+                tx.nonce,
+                tx.gas_limit,
+                tx.max_fee_per_gas,
+                tx.max_priority_fee_per_gas,
+                vec![],
+                tx.chain_id,
+            )?;
 
-			// Ensure vault is initialized
-			ensure!(VaultConfig::<T>::get().is_some(), Error::<T>::NotInitialized);
+            let path: Vec<u8> = requester.encode();
+            let req_id = Self::generate_request_id(&requester, &rlp, 60, 0, &path, b"ecdsa", b"ethereum", b"");
 
-			// Ensure no duplicate request
-			ensure!(
-				PendingDeposits::<T>::get(&request_id).is_none(),
-				Error::<T>::InvalidRequestId
-			);
+            let call2 = IGasFaucet::fundCall {
+                to: Address::from_slice(&to),
+                amount: U256::from(amount_wei),
+                requestId: alloy_primitives::FixedBytes(req_id),
+            };
 
-			// Get signet deposit amount and pallet account
-			let signet_deposit = pallet_signet::Pallet::<T>::signature_deposit();
-			let pallet_account = Self::account_id();
-			let existential_deposit = <T as pallet_signet::Config>::Currency::minimum_balance();
+            let rlp2 = pallet_build_evm_tx::Pallet::<T>::build_evm_tx(
+                frame_system::RawOrigin::Signed(requester.clone()).into(),
+                Some(H160::from(faucet)),
+                0u128,
+                call2.abi_encode(),
+                tx.nonce,
+                tx.gas_limit,
+                tx.max_fee_per_gas,
+                tx.max_priority_fee_per_gas,
+                vec![],
+                tx.chain_id,
+            )?;
 
-			// Ensure pallet account has sufficient balance
-			// It needs at least ED + signet_deposit to transfer signet_deposit while staying alive
-			let pallet_balance = <T as pallet_signet::Config>::Currency::free_balance(&pallet_account);
-			let required_balance = existential_deposit.saturating_add(signet_deposit);
-			ensure!(pallet_balance >= required_balance, Error::<T>::PalletAccountNotFunded);
+            Pending::<T>::try_mutate(req_id, |slot| -> DispatchResult {
+                ensure!(slot.is_none(), Error::<T>::DuplicateRequest);
+                *slot = Some(PendingData {
+                    requester: requester.clone(),
+                    pay_amount,
+                    to,
+                    amount_wei,
+                });
+                Ok(())
+            })?;
 
-			// Transfer signet deposit from requester to pallet account
-			<T as pallet_signet::Config>::Currency::transfer(
-				&requester,
-				&pallet_account,
-				signet_deposit,
-				frame_support::traits::ExistenceRequirement::AllowDeath,
-			)?;
+            let explorer_schema = Vec::<u8>::new();
+            let callback_schema = serde_json::to_vec(&serde_json::json!("bool")).map_err(|_| Error::<T>::Serialization)?;
 
-			// Use requester account as path
-			let path = {
-				let encoded = requester.encode();
-				format!("0x{}", hex::encode(encoded)).into_bytes()
-			};
+            pallet_signet::Pallet::<T>::sign_respond(
+                frame_system::RawOrigin::Signed(pallet.clone()).into(),
+                BoundedVec::<u8, ConstU32<65536>>::try_from(rlp2).map_err(|_| Error::<T>::Serialization)?,
+                60,
+                0,
+                BoundedVec::try_from(path).map_err(|_| Error::<T>::Serialization)?,
+                BoundedVec::try_from(b"ecdsa".to_vec()).map_err(|_| Error::<T>::Serialization)?,
+                BoundedVec::try_from(b"ethereum".to_vec()).map_err(|_| Error::<T>::Serialization)?,
+                BoundedVec::try_from(Vec::new()).map_err(|_| Error::<T>::Serialization)?,
+                pallet_signet::SerializationFormat::AbiJson,
+                BoundedVec::try_from(explorer_schema).map_err(|_| Error::<T>::Serialization)?,
+                pallet_signet::SerializationFormat::Borsh,
+                BoundedVec::try_from(callback_schema).map_err(|_| Error::<T>::Serialization)?,
+            )?;
 
-			let recipient = Address::from_slice(&SEPOLIA_VAULT_ADDRESS);
-			let call = IERC20::transferCall {
-				to: recipient,
-				amount: U256::from(amount),
-			};
+            Self::deposit_event(Event::FundRequested {
+                request_id: req_id,
+                requester,
+                to,
+                amount_wei,
+                pay_amount,
+            });
 
-			// Build EVM transaction
-			let rlp_encoded = pallet_build_evm_tx::Pallet::<T>::build_evm_tx(
-				frame_system::RawOrigin::Signed(requester.clone()).into(),
-				Some(H160::from(erc20_address)),
-				tx_params.value,
-				call.abi_encode(),
-				tx_params.nonce,
-				tx_params.gas_limit,
-				tx_params.max_fee_per_gas,
-				tx_params.max_priority_fee_per_gas,
-				vec![],
-				tx_params.chain_id,
-			)?;
+            Ok(())
+        }
 
-			// Generate and verify request ID
-			let computed_request_id = Self::generate_request_id(
-				&Self::account_id(),
-				&rlp_encoded,
-				60,
-				0,
-				&path,
-				b"ecdsa",
-				b"ethereum",
-				b"",
-			);
+				#[pallet::call_index(2)]
+        #[pallet::weight(50_000)]
+        pub fn respond_fund(
+            origin: OriginFor<T>,
+            request_id: [u8; 32],
+            serialized_output: BoundedVec<u8, ConstU32<65536>>,
+            signature: pallet_signet::Signature,
+        ) -> DispatchResult {
+					let _ = ensure_signed(origin)?;
+					let pending = Pending::<T>::take(&request_id).ok_or(Error::<T>::NotFound)?;
+					let mpc = ConfigData::<T>::get().ok_or(Error::<T>::NotInitialized)?;
 
-			ensure!(computed_request_id == request_id, Error::<T>::InvalidRequestId);
+					let hash = Self::hash_message(&request_id, &serialized_output);
+					Self::verify_signature_from_address(&hash, &signature, &mpc)?;
 
-			// Store pending deposit
-			PendingDeposits::<T>::insert(
-				&request_id,
-				PendingDepositData {
-					requester: requester.clone(),
-					amount,
-					erc20_address,
-					path: path.clone().try_into().map_err(|_| Error::<T>::PathTooLong)?,
-				},
-			);
+					let ok = {
+							use borsh::BorshDeserialize;
+							bool::try_from_slice(&serialized_output).map_err(|_| Error::<T>::InvalidOutput)?
+					};
 
-			// Create schemas for the response
-			let functions = IERC20::abi::functions();
-			let transfer_func = functions
-				.get("transfer")
-				.and_then(|funcs| funcs.first())
-				.ok_or(Error::<T>::InvalidAbi)?;
+					if ok {
+							Self::deposit_event(Event::FundSucceeded { request_id });
+							Ok(())
+					} else {
+							<T as pallet_signet::Config>::Currency::transfer(
+									&Self::account_id(),
+									&pending.requester,
+									pending.pay_amount,
+									frame_support::traits::ExistenceRequirement::AllowDeath,
+							)?;
+							Self::deposit_event(Event::FundFailed { request_id, refunded: pending.pay_amount });
+							Ok(())
+					}
+        }
 
-			let explorer_schema =
-				serde_json::to_vec(&transfer_func.outputs).map_err(|_| Error::<T>::SerializationError)?;
+    }
 
-			let callback_schema =
-				serde_json::to_vec(&serde_json::json!("bool")).map_err(|_| Error::<T>::SerializationError)?;
-
-			// Call sign_respond from the pallet account
-			pallet_signet::Pallet::<T>::sign_respond(
-				frame_system::RawOrigin::Signed(Self::account_id()).into(),
-				BoundedVec::try_from(rlp_encoded).map_err(|_| Error::<T>::SerializationError)?,
-				60,
-				0,
-				BoundedVec::try_from(path).map_err(|_| Error::<T>::PathTooLong)?,
-				BoundedVec::try_from(b"ecdsa".to_vec()).map_err(|_| Error::<T>::SerializationError)?,
-				BoundedVec::try_from(b"ethereum".to_vec()).map_err(|_| Error::<T>::SerializationError)?,
-				BoundedVec::try_from(vec![]).map_err(|_| Error::<T>::SerializationError)?,
-				pallet_signet::SerializationFormat::AbiJson,
-				BoundedVec::try_from(explorer_schema).map_err(|_| Error::<T>::SerializationError)?,
-				pallet_signet::SerializationFormat::Borsh,
-				BoundedVec::try_from(callback_schema).map_err(|_| Error::<T>::SerializationError)?,
-			)?;
-
-			Self::deposit_event(Event::DepositRequested {
-				request_id,
-				requester,
-				erc20_address,
-				amount,
-			});
-
-			Ok(())
-		}
-
-		/// Claim deposited ERC20 tokens after signature verification
-		#[pallet::call_index(2)]
-		#[pallet::weight(Weight::from_parts(50_000, 0))]
-		pub fn claim_erc20(
-			origin: OriginFor<T>,
-			request_id: [u8; 32],
-			serialized_output: BoundedVec<u8, ConstU32<MAX_SERIALIZED_OUTPUT_LENGTH>>,
-			signature: pallet_signet::Signature,
-		) -> DispatchResult {
-			let claimer = ensure_signed(origin)?;
-
-			// Get pending deposit
-			let pending = PendingDeposits::<T>::get(&request_id).ok_or(Error::<T>::DepositNotFound)?;
-
-			// Verify claimer is the original requester
-			ensure!(pending.requester == claimer, Error::<T>::UnauthorizedClaimer);
-
-			// Get vault config
-			let config = VaultConfig::<T>::get().ok_or(Error::<T>::NotInitialized)?;
-
-			// Verify signature
-			let message_hash = Self::hash_message(&request_id, &serialized_output);
-			Self::verify_signature_from_address(&message_hash, &signature, &config.mpc_root_signer_address)?;
-
-			// Check for error magic prefix
-			const ERROR_PREFIX: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF];
-
-			let success = if serialized_output.len() >= 4 && &serialized_output[..4] == ERROR_PREFIX {
-				false
-			} else {
-				// Decode boolean (Borsh serialized)
-				use borsh::BorshDeserialize;
-				bool::try_from_slice(&serialized_output).map_err(|_| Error::<T>::InvalidOutput)?
-			};
-
-			ensure!(success, Error::<T>::TransferFailed);
-
-			// Update user balance
-			UserBalances::<T>::mutate(&claimer, &pending.erc20_address, |balance| -> DispatchResult {
-				*balance = balance.checked_add(pending.amount).ok_or(Error::<T>::Overflow)?;
-				Ok(())
-			})?;
-
-			// Clean up storage
-			PendingDeposits::<T>::remove(&request_id);
-
-			Self::deposit_event(Event::DepositClaimed {
-				request_id,
-				claimer,
-				erc20_address: pending.erc20_address,
-				amount: pending.amount,
-			});
-
-			Ok(())
-		}
-	}
 
 	// ========================= Helper Functions =========================
 
